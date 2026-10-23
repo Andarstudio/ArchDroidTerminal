@@ -18,180 +18,6 @@ jobs:
           unzip -q ArchDroidTerminal.zip -d .
           ls ArchDroidTerminal
 
-      - name: "Apply fixes"
-        working-directory: ArchDroidTerminal
-        shell: bash
-        run: |
-          D=app/src/main/java/dev/archdroid/terminal
-          cat > $D/env/Downloader.kt <<'EOF'
-          package dev.archdroid.terminal.env
-
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.ensureActive
-          import kotlinx.coroutines.withContext
-          import okhttp3.OkHttpClient
-          import okhttp3.Request
-          import java.io.File
-          import java.io.FileInputStream
-          import java.io.IOException
-          import java.io.RandomAccessFile
-          import java.security.MessageDigest
-          import java.util.concurrent.TimeUnit
-          import kotlin.coroutines.coroutineContext
-
-          class Downloader(
-              private val client: OkHttpClient = OkHttpClient.Builder()
-                  .connectTimeout(20, TimeUnit.SECONDS)
-                  .readTimeout(60, TimeUnit.SECONDS)
-                  .followRedirects(true)
-                  .followSslRedirects(true)
-                  .build(),
-          ) {
-              suspend fun fetchText(url: String): String = withContext(Dispatchers.IO) {
-                  client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
-                      if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
-                      val body = resp.body ?: throw IOException("Empty response for $url")
-                      body.string().take(64 * 1024)
-                  }
-              }
-
-              suspend fun contentLength(url: String): Long? = withContext(Dispatchers.IO) {
-                  client.newCall(Request.Builder().url(url).head().build()).execute().use { resp ->
-                      if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
-                      resp.header("Content-Length")?.toLongOrNull()
-                  }
-              }
-
-              suspend fun download(url: String, dest: File, onProgress: (done: Long, total: Long) -> Unit) =
-                  withContext(Dispatchers.IO) {
-                      dest.parentFile?.mkdirs()
-                      val part = File(dest.path + ".part")
-                      var existing = if (part.exists()) part.length() else 0L
-
-                      val builder = Request.Builder().url(url)
-                      if (existing > 0) builder.header("Range", "bytes=$existing-")
-                      client.newCall(builder.build()).execute().use { resp ->
-                          val append: Boolean
-                          val total: Long
-                          when (resp.code) {
-                              206 -> {
-                                  append = true
-                                  total = resp.header("Content-Range")?.substringAfter('/')?.toLongOrNull()
-                                      ?: (existing + (resp.body?.contentLength() ?: -1))
-                              }
-                              200 -> {
-                                  append = false
-                                  existing = 0
-                                  total = resp.body?.contentLength() ?: -1
-                              }
-                              416 -> {
-                                  part.delete()
-                                  throw IOException("Server rejected resume range; the partial file was discarded. Retry to download again.")
-                              }
-                              else -> throw IOException("HTTP ${resp.code} for $url")
-                          }
-                          val body = resp.body ?: throw IOException("Empty response")
-                          RandomAccessFile(part, "rw").use { raf ->
-                              if (append) raf.seek(existing) else raf.setLength(0)
-                              val buf = ByteArray(64 * 1024)
-                              var done = existing
-                              var lastReport = 0L
-                              body.byteStream().use { input ->
-                                  while (true) {
-                                      coroutineContext.ensureActive()
-                                      val n = input.read(buf)
-                                      if (n < 0) break
-                                      raf.write(buf, 0, n)
-                                      done += n
-                                      val now = System.nanoTime()
-                                      if (now - lastReport > 200_000_000L) {
-                                          lastReport = now
-                                          onProgress(done, total)
-                                      }
-                                  }
-                              }
-                              onProgress(done, total)
-                              if (total > 0 && done != total) {
-                                  throw IOException("Download ended early ($done of $total bytes). Retry to resume.")
-                              }
-                          }
-                      }
-                      if (dest.exists()) dest.delete()
-                      if (!part.renameTo(dest)) throw IOException("Could not move ${part.name} into place")
-                  }
-
-              data class Digests(val md5: String, val sha256: String)
-
-              suspend fun digests(file: File, onProgress: (done: Long, total: Long) -> Unit): Digests =
-                  withContext(Dispatchers.IO) {
-                      val md5 = MessageDigest.getInstance("MD5")
-                      val sha = MessageDigest.getInstance("SHA-256")
-                      val total = file.length()
-                      var done = 0L
-                      var last = 0L
-                      FileInputStream(file).use { input ->
-                          val buf = ByteArray(256 * 1024)
-                          while (true) {
-                              coroutineContext.ensureActive()
-                              val n = input.read(buf)
-                              if (n < 0) break
-                              md5.update(buf, 0, n)
-                              sha.update(buf, 0, n)
-                              done += n
-                              val now = System.nanoTime()
-                              if (now - last > 200_000_000L) { last = now; onProgress(done, total) }
-                          }
-                      }
-                      onProgress(total, total)
-                      Digests(md5.digest().toHex(), sha.digest().toHex())
-                  }
-
-              companion object {
-                  private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
-
-                  fun parseMd5(text: String, fileName: String): String? {
-                      val lines = text.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-                      val candidates = lines.filter { it.contains(fileName) }.ifEmpty { lines }
-                      for (line in candidates) {
-                          val token = line.split(Regex("\\s+")).firstOrNull()?.lowercase() ?: continue
-                          if (token.matches(Regex("[0-9a-f]{32}"))) return token
-                      }
-                      return null
-                  }
-              }
-          }
-          EOF
-          python3 - <<'PY'
-          p = "app/src/main/java/dev/archdroid/terminal/files/LinuxFs.kt"
-          s = open(p).read()
-          a = s.index("    fun readText(")
-          b = s.index("    /** Deletes the entry itself")
-          new = '''    fun readText(path: String, maxBytes: Int = 256 * 1024): String {
-              val f = resolve(path)
-              if (!f.isFile) throw IOException("Not a regular file")
-              val buf = ByteArray(maxBytes)
-              var n = 0
-              f.inputStream().use { ins ->
-                  while (n < maxBytes) {
-                      val r = ins.read(buf, n, maxBytes - n)
-                      if (r < 0) break
-                      n += r
-                  }
-              }
-              return String(buf, 0, n, Charsets.UTF_8) + if (f.length() > maxBytes) "\\n... (truncated)" else ""
-          }
-
-          '''
-          open(p, "w").write(s[:a] + new + s[b:])
-          PY
-
-      - name: "Fix Termux API mismatch"
-        working-directory: ArchDroidTerminal
-        shell: bash
-        run: |
-          sed -i '/setTerminalShellPid/d' app/src/main/java/dev/archdroid/terminal/terminal/SessionManager.kt
-          grep -c setTerminalShellPid app/src/main/java/dev/archdroid/terminal/terminal/SessionManager.kt || true
-
       - name: "Set up JDK 17"
         uses: actions/setup-java@v4
         with:
@@ -203,13 +29,13 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: "Fetch proot"
+      - name: "Fetch proot and its libraries"
         working-directory: ArchDroidTerminal
         shell: bash
         run: |
           set -euo pipefail
           BASE=https://packages.termux.dev/apt/termux-main
-          OUT=app/src/main/jniLibs/arm64-v8a
+          OUT="$PWD/app/src/main/jniLibs/arm64-v8a"
           mkdir -p "$OUT" _work
           cd _work
           curl -fsSL "$BASE/dists/stable/main/binary-aarch64/Packages" -o Packages
@@ -219,20 +45,39 @@ jobs:
           fetch() {
             file=$(field "$1" Filename)
             sha=$(field "$1" SHA256)
+            [ -n "$file" ] || { echo "::error::package $1 not found in Termux index"; exit 1; }
             curl -fsSL "$BASE/$file" -o "$1.deb"
             echo "$sha  $1.deb" | sha256sum -c -
             mkdir -p "x-$1"
             dpkg-deb -x "$1.deb" "x-$1"
+            echo "$1 depends on: $(field "$1" Depends)"
+          }
+          biggest() {
+            find "$1" -type f -name "$2" -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-
           }
           fetch proot
           fetch libtalloc
+          fetch libandroid-shmem
           P=$(find x-proot -type f -name proot -path '*bin*' | head -n1)
           L=$(find x-proot -type f -name loader -path '*proot*' | head -n1)
-          T=$(find x-libtalloc -type f -name 'libtalloc.so*' -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
-          cp "$P" "../$OUT/libproot.so"
-          cp "$L" "../$OUT/libproot-loader.so"
-          cp "$T" "../$OUT/libtalloc.so"
-          ls -l "../$OUT"
+          T=$(biggest x-libtalloc 'libtalloc.so*')
+          S=$(biggest x-libandroid-shmem 'libandroid-shmem.so*')
+          [ -n "$P" ] && [ -n "$L" ] && [ -n "$T" ] && [ -n "$S" ] || { echo "::error::could not locate all files"; exit 1; }
+          cp "$P" "$OUT/libproot.so"
+          cp "$L" "$OUT/libproot-loader.so"
+          cp "$T" "$OUT/libtalloc.so"
+          cp "$S" "$OUT/libandroid-shmem.so"
+          ls -l "$OUT"
+          echo "--- checking required libraries ---"
+          for f in libproot.so libandroid-shmem.so; do
+            readelf -d "$OUT/$f" | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'
+          done | sort -u | while read -r n; do
+            echo "needs: $n"
+            case "$n" in
+              libc.so|libm.so|libdl.so|liblog.so|libz.so|libandroid.so|libstdc++.so|libtalloc.so.2) continue ;;
+            esac
+            [ -f "$OUT/$n" ] || { echo "::error::proot needs $n which is not bundled"; exit 1; }
+          done
 
       - name: "Build debug APK"
         working-directory: ArchDroidTerminal
