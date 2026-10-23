@@ -185,6 +185,13 @@ jobs:
           open(p, "w").write(s[:a] + new + s[b:])
           PY
 
+      - name: "Fix Termux API mismatch"
+        working-directory: ArchDroidTerminal
+        shell: bash
+        run: |
+          sed -i '/setTerminalShellPid/d' app/src/main/java/dev/archdroid/terminal/terminal/SessionManager.kt
+          grep -c setTerminalShellPid app/src/main/java/dev/archdroid/terminal/terminal/SessionManager.kt || true
+
       - name: "Set up JDK 17"
         uses: actions/setup-java@v4
         with:
