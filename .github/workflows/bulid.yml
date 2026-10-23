@@ -8,27 +8,74 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      ZIP_NAME: ArchDroidTerminal.zip
     steps:
-      - name: Check out repository (contains the zip)
+      - name: "Check out repository"
         uses: actions/checkout@v4
 
-      - name: Extract project zip
+      - name: "Extract project zip"
         run: |
-          test -f "$ZIP_NAME" || { echo "::error::$ZIP_NAME not found in repo root"; exit 1; }
-          unzip -q "$ZIP_NAME" -d .
+          test -f ArchDroidTerminal.zip
+          unzip -q ArchDroidTerminal.zip -d .
           ls ArchDroidTerminal
 
-      - name: Set up JDK 17
+      - name: "Set up JDK 17"
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: "17"
 
-      - name: Set up Gradle 8.9
+      - name: "Set up Gradle 8.9"
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Fetch proot, loader and
+      - name: "Fetch proot"
+        working-directory: ArchDroidTerminal
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=https://packages.termux.dev/apt/termux-main
+          OUT=app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$OUT" _work
+          cd _work
+          curl -fsSL "$BASE/dists/stable/main/binary-aarch64/Packages" -o Packages
+          field() {
+            awk -v pkg="$1" -v f="$2" 'BEGIN{RS="";FS="\n"} $1=="Package: " pkg {for(i=1;i<=NF;i++) if (index($i,f": ")==1){print substr($i,length(f)+3); exit}}' Packages
+          }
+          fetch() {
+            file=$(field "$1" Filename)
+            sha=$(field "$1" SHA256)
+            curl -fsSL "$BASE/$file" -o "$1.deb"
+            echo "$sha  $1.deb" | sha256sum -c -
+            mkdir -p "x-$1"
+            dpkg-deb -x "$1.deb" "x-$1"
+          }
+          fetch proot
+          fetch libtalloc
+          P=$(find x-proot -type f -name proot -path '*bin*' | head -n1)
+          L=$(find x-proot -type f -name loader -path '*proot*' | head -n1)
+          T=$(find x-libtalloc -type f -name 'libtalloc.so*' -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+          cp "$P" "../$OUT/libproot.so"
+          cp "$L" "../$OUT/libproot-loader.so"
+          cp "$T" "../$OUT/libtalloc.so"
+          ls -l "../$OUT"
+
+      - name: "Unit tests"
+        working-directory: ArchDroidTerminal
+        run: gradle testDebugUnitTest --no-daemon --stacktrace
+
+      - name: "Build debug APK"
+        working-directory: ArchDroidTerminal
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: "Build release APK"
+        working-directory: ArchDroidTerminal
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: "Upload APKs"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArchDroidTerminal-apks
+          path: |
+            ArchDroidTerminal/app/build/outputs/apk/debug/*.apk
+            ArchDroidTerminal/app/build/outputs/apk/release/*.apk
